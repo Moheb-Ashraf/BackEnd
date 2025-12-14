@@ -28,7 +28,7 @@ const verifyToken = (req, res, next) => {
     if (!token) return res.status(401).send("من فضلك سجل دخول أولاً");
 
     try {
-        const verified = jwt.verify(token, "SECRET_KEY_CHURCH_123");
+        const verified = jwt.verify(token, process.env.TOKEN_SECRET || "SECRET_KEY_CHURCH_123");
         req.user = verified;
         next();
     } catch (err) {
@@ -43,14 +43,14 @@ const verifyToken = (req, res, next) => {
 // تسجيل خادم جديد
 app.post('/api/register', async (req, res) => {
     try {
-        // تشفير الباسورد
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(req.body.password, salt);
 
         const newServant = new Servant({
             name: req.body.name,
             email: req.body.email,
-            password: hashedPassword
+            password: hashedPassword,
+            role: 'servant' // الافتراضي خادم عادي
         });
         await newServant.save();
         res.send("تم تسجيل الخادم بنجاح");
@@ -68,26 +68,23 @@ app.post('/api/login', async (req, res) => {
     if (!validPass) return res.status(400).send("الباسورد غير صحيح");
 
     // إنشاء التوكن
-    const token = jwt.sign({ _id: servant._id, email: servant.email }, "SECRET_KEY_CHURCH_123");
+    const token = jwt.sign({ _id: servant._id, email: servant.email }, process.env.TOKEN_SECRET || "SECRET_KEY_CHURCH_123");
     
-    // إرسال التوكن واسم الخادم
+    // إرسال البيانات (بما فيها الرتبة role)
     res.json({ 
-    token: token, 
-    name: servant.name, 
-    id: servant._id, 
-    role: servant.role // بنرجع الرتبة
+        token: token, 
+        name: servant.name, 
+        id: servant._id,
+        role: servant.role 
+    });
 });
-});
-
-
-
 
 
 // ==========================================
-// 2. قسم المخدومين (Data)
+// 2. قسم إدارة المخدومين
 // ==========================================
 
-// أ. إضافة مخدوم جديد (إنشاء ملف)
+// إضافة مخدوم جديد
 app.post('/api/create-makhdoom', verifyToken, async (req, res) => {
     try {
         const newMakhdoom = new Makhdoom({
@@ -101,27 +98,7 @@ app.post('/api/create-makhdoom', verifyToken, async (req, res) => {
     }
 });
 
-// ب. جلب بيانات المخدوم + تاريخه الروحي (ده طلبك الجديد)
-app.get('/api/makhdoom-details/:id', verifyToken, async (req, res) => {
-    try {
-        // 1. نجيب البيانات الأساسية والنقاط
-        const makhdoom = await Makhdoom.findById(req.params.id);
-        
-        // 2. نجيب كل الحاجات اللي سمعها (Records) الخاصة بالـ ID ده
-        // .sort({ date: -1 }) عشان يجيب الأحدث الأول
-        const history = await Record.find({ makhdoomId: req.params.id }).sort({ date: -1 });
-
-        // 3. نبعت الاتنين مع بعض للفرونت إند
-        res.json({
-            info: makhdoom,   // الاسم والنقاط
-            history: history  // لستة الشواهد والمزامير اللي سمعها
-        });
-    } catch (err) {
-        res.status(404).send("مخدوم غير موجود");
-    }
-});
-
-// ج. جلب كل المخدومين (عشان القائمة الرئيسية)
+// جلب كل المخدومين (للقائمة الرئيسية)
 app.get('/api/all-makhdoomen', verifyToken, async (req, res) => {
     try {
         const all = await Makhdoom.find();
@@ -131,111 +108,143 @@ app.get('/api/all-makhdoomen', verifyToken, async (req, res) => {
     }
 });
 
-
-// ==========================================
-// 3. قسم العمليات (تسجيل وحضور)
-// ==========================================
-
-// أ. تسجيل الحضور (+5 نقط)
-app.post('/api/attendance', verifyToken, async (req, res) => {
-    const { makhdoomId } = req.body; // لازم الفرونت يبعت الآيدي
-
+// جلب تفاصيل مخدوم معين + السجل التاريخي
+app.get('/api/makhdoom-details/:id', verifyToken, async (req, res) => {
     try {
-        // تسجيل واقعة الحضور
+        const makhdoom = await Makhdoom.findById(req.params.id);
+        if (!makhdoom) return res.status(404).send("مخدوم غير موجود");
+
+        const history = await Record.find({ makhdoomId: req.params.id }).sort({ date: -1 });
+
+        res.json({
+            info: makhdoom,
+            history: history
+        });
+    } catch (err) {
+        res.status(404).send("مخدوم غير موجود");
+    }
+});
+
+// (جديد) حذف مخدوم نهائياً
+app.delete('/api/delete-makhdoom/:id', verifyToken, async (req, res) => {
+    try {
+        const makhdoomId = req.params.id;
+
+        // 1. حذف كل السجلات المرتبطة بيه (عشان الداتا بيز تنضف)
+        await Record.deleteMany({ makhdoomId: makhdoomId });
+        await Attendance.deleteMany({ makhdoomId: makhdoomId });
+
+        // 2. حذف المخدوم نفسه
+        await Makhdoom.findByIdAndDelete(makhdoomId);
+
+        res.send("تم حذف المخدوم وكل بياناته بنجاح");
+    } catch (err) {
+        res.status(500).send("حدث خطأ أثناء الحذف");
+    }
+});
+
+
+// ==========================================
+// 3. قسم العمليات والنقاط
+// ==========================================
+
+// تسجيل الحضور (+5 نقط)
+app.post('/api/attendance', verifyToken, async (req, res) => {
+    const { makhdoomId } = req.body;
+    try {
         const newAttendance = new Attendance({
             makhdoomId: makhdoomId,
             servantId: req.user._id
         });
         await newAttendance.save();
 
-        // زيادة النقاط
         await Makhdoom.findByIdAndUpdate(makhdoomId, { $inc: { totalPoints: 5 } });
-
-        res.send("تم تسجيل الحضور وإضافة 5 نقاط");
+        res.send("تم تسجيل الحضور");
     } catch (err) {
         res.status(500).send(err.message);
     }
 });
 
-app.post('/api/add-bonus', verifyToken, async (req, res) => {
-    const { makhdoomId, points, description } = req.body;
-
-    try {
-        const newRecord = new Record({
-            makhdoomId,
-            servantId: req.user._id, // من التوكن
-            servantEmail: req.user.email,
-            type: 'bonus',
-            description: description, // مثلا: "حضور قداس"
-            pointsEarned: points
-        });
-        await newRecord.save();
-
-        await Makhdoom.findByIdAndUpdate(makhdoomId, { $inc: { totalPoints: points } });
-
-        res.json({ message: "تم إضافة البونص", pointsAdded: points });
-    } catch (err) {
-        res.status(500).send(err.message);
-    }
-});
-
-app.get('/api/admin/logs', verifyToken, async (req, res) => {
-    try {
-        // نتأكد إن اللي بيطلب ده أدمن
-        const requester = await Servant.findById(req.user._id);
-        if (requester.role !== 'admin') {
-            return res.status(403).send("غير مسموح إلا للمشرفين");
-        }
-
-        // هات كل السجلات واعمل populate عشان تظهر اسماء الخدام والمخدومين
-        const logs = await Record.find()
-            .populate('servantId', 'name') // هات اسم الخادم
-            .populate('makhdoomId', 'name') // هات اسم المخدوم
-            .sort({ date: -1 }); // الأحدث أولاً
-
-        res.json(logs);
-    } catch (err) {
-        res.status(500).send(err.message);
-    }
-});
-
-// ب. تسجيل متابعة روحية (مزمور أو إنجيل) وحساب النقاط
+// إضافة سجل روحي (إنجيل / مزمور)
 app.post('/api/add-record', verifyToken, async (req, res) => {
     const { makhdoomId, category, bookName, chapter, verses, versesCount } = req.body;
 
     let pointsToAdd = 0;
     let finalBookName = bookName;
 
-    // --- حساب النقاط ---
     if (category === 'mazmour') {
         finalBookName = 'المزامير';
-        // المعادلة: عدد آيات المزمور × 2
-        // لو مبعتش عدد الآيات هنحسبها صفر
         pointsToAdd = (versesCount || 0) * 2; 
     } else {
-        // إنجيل: 2 نقطة ثابتة
-        pointsToAdd = 2;
+        pointsToAdd = 2; // الإنجيل بـ 2 نقطة
     }
 
     try {
-        // 1. حفظ السجل
         const newRecord = new Record({
-            makhdoomId: makhdoomId, // بنربط بالآيدي
+            makhdoomId,
+            servantId: req.user._id,
             servantEmail: req.user.email,
             type: category,
             book: finalBookName,
             chapter,
             verses,
-            pointsEarned: pointsToAdd // بنسجل خد كام نقطة في المرة دي
+            pointsEarned: pointsToAdd
         });
         await newRecord.save();
 
-        // 2. تحديث رصيد المخدوم
         await Makhdoom.findByIdAndUpdate(makhdoomId, { $inc: { totalPoints: pointsToAdd } });
-
         res.json({ message: "تم التسجيل", pointsAdded: pointsToAdd });
     } catch (error) {
         res.status(500).send(error.message);
+    }
+});
+
+// (جديد) إضافة بونص أو خصم
+// الفرونت إند بيبعت الرقم موجب (مكافأة) أو سالب (خصم)
+app.post('/api/add-bonus', verifyToken, async (req, res) => {
+    const { makhdoomId, points, description } = req.body;
+
+    try {
+        const newRecord = new Record({
+            makhdoomId,
+            servantId: req.user._id,
+            servantEmail: req.user.email,
+            type: 'bonus', // نوع جديد للسجل
+            description: description,
+            pointsEarned: points // الرقم هييجي جاهز (+ أو -)
+        });
+        await newRecord.save();
+
+        // $inc بيزود الرقم، ولو الرقم سالب بينقصه
+        await Makhdoom.findByIdAndUpdate(makhdoomId, { $inc: { totalPoints: points } });
+
+        res.json({ message: "تم تعديل النقاط", pointsAdded: points });
+    } catch (err) {
+        res.status(500).send(err.message);
+    }
+});
+
+
+// ==========================================
+// 4. قسم الأدمن (المشرفين)
+// ==========================================
+app.get('/api/admin/logs', verifyToken, async (req, res) => {
+    try {
+        // التحقق من الرتبة
+        const requester = await Servant.findById(req.user._id);
+        if (requester.role !== 'admin') {
+            return res.status(403).send("غير مسموح إلا للمشرفين");
+        }
+
+        // جلب كل السجلات مع بيانات الخادم والمخدوم
+        const logs = await Record.find()
+            .populate('servantId', 'name')
+            .populate('makhdoomId', 'name')
+            .sort({ date: -1 });
+
+        res.json(logs);
+    } catch (err) {
+        res.status(500).send(err.message);
     }
 });
 
